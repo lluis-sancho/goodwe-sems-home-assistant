@@ -513,7 +513,6 @@ def sensor_options_for_data(
                 SensorDeviceClass.POWER,
                 UnitOfPower.WATT,
                 SensorStateClass.MEASUREMENT,
-                custom_value_handler=status_value_handler(["loadStatus"]),
             ),
             SemsHomekitSensorType(
                 device_info,
@@ -923,8 +922,32 @@ class SemsSensor(CoordinatorEntity[SemsCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> Any:
-        """Return legacy HomeKit load value."""
-        return super().native_value
+        """Return the current value."""
+
+        value = self._get_native_value_from_coordinator()
+
+        if isinstance(value, str):
+            if match := self.str_clean_regex.search(value):
+                value = match.group(1)
+            else:
+                # If no match found (e.g., empty string), treat as unavailable
+                value = None
+
+        if value is None:
+            return None
+        if self._empty_value is not None and value == self._empty_value:
+            return None
+
+        if self._custom_value_handler is not None:
+            data = self._get_data_dict()
+            if data is None:
+                return None
+            return self._custom_value_handler(value, data)
+
+        try:
+            return self._data_type_converter(value)
+        except (TypeError, ValueError):
+            return value
 
 
 class SemsInverterSensor(SemsSensor):
