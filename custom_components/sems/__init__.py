@@ -110,138 +110,171 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
         )
 
     async def _async_update_data(self) -> SemsData:
-        """Fetch data from API endpoint.
-
-        This is the place to pre-process the data to lookup tables
-        so entities can quickly look up their data.
-        """
-        # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-        # handled by the data update coordinator.
-        # async with async_timeout.timeout(10):
+        """Fetch data from API endpoint."""
         try:
             result = await self.hass.async_add_executor_job(
                 self.sems_api.getData, self.station_id
             )
+        except SemsRateLimitedError as err:
+            raise UpdateFailed(
+                f"SEMS API rate limited (retry after {err.retry_after}s)"
+            ) from err
+        except Exception as err:
+            _LOGGER.warning("SEMS getData failed: %s", err)
+            result = {}
+
+        try:
             flow = await self.hass.async_add_executor_job(
                 self.sems_api.getFlow, self.station_id
             )
-
             _LOGGER.debug("semsApi.getFlow result: %s", redact_for_log(flow))
         except SemsRateLimitedError as err:
             raise UpdateFailed(
                 f"SEMS API rate limited (retry after {err.retry_after}s)"
             ) from err
         except Exception as err:
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
-        else:
-            _LOGGER.debug("semsApi.getData result: %s", redact_for_log(result))
+            _LOGGER.warning("SEMS getFlow failed: %s", err)
+            flow = {}
 
-            inverters = result.get("inverter")
-            inverters_by_sn: dict[str, dict[str, Any]] = {}
-            if not inverters or not isinstance(inverters, list):
+        _LOGGER.debug("semsApi.getData result: %s", redact_for_log(result))
+
+        # If the legacy endpoint is temporarily down, preserve the previous
+        # coordinator data and refresh only the realtime power-flow values.
+        if not result:
+            previous = self.data if isinstance(self.data, SemsData) else None
+
+            if previous is None:
                 raise UpdateFailed(
-                    "Error communicating with API: invalid or missing inverter data. See debug logs."
+                    "Error communicating with API: getData returned no data and "
+                    "there is no previous coordinator data available yet."
                 )
 
-            # Get Inverter Data
-            for inverter in inverters:
-                inverter_full = inverter.get("invert_full")
-                if not isinstance(inverter_full, dict):
-                    continue
-
-                name = inverter_full.get("name")
-                sn = inverter_full.get("sn")
-                if not isinstance(sn, str):
-                    continue
-
-                _LOGGER.debug(
-                    "Found inverter attribute %s %s",
-                    name,
-                    redact_for_log(sn),
-                )
-                inverters_by_sn[sn] = inverter_full
-
-            # Add currency
-            kpi = result.get("kpi")
-            if not isinstance(kpi, dict):
-                kpi = {}
-            currency = kpi.get("currency")
-
-            has_powerflow = bool(result.get("hasPowerflow"))
-            has_energy_statistics_charts = bool(
-                result.get(GOODWE_SPELLING.hasEnergyStatisticsCharts)
+            previous_homekit = (
+                dict(previous.homekit) if isinstance(previous.homekit, dict) else {}
             )
 
-            homekit: dict[str, Any] | None = None
+            if flow:
+                p_system = flow.get("pSystem")
+                p_grid = flow.get("pGrid")
+                p_consum = flow.get("pConsum")
 
-            if has_powerflow:
-                _LOGGER.debug("Found powerflow data")
-                powerflow = result.get("powerflow")
-                if not isinstance(powerflow, dict):
-                    powerflow = {}
+                if p_system is not None:
+                    previous_homekit["pv"] = float(p_system) * 1000
+                if p_grid is not None:
+                    previous_homekit["grid"] = float(p_grid) * 1000
+                if p_consum is not None:
+                    previous_homekit["load"] = float(p_consum) * 1000
 
-                if has_energy_statistics_charts:
-                    charts = result.get(GOODWE_SPELLING.energyStatisticsCharts)
-                    if not isinstance(charts, dict):
-                        charts = {}
-                    totals = result.get(GOODWE_SPELLING.energyStatisticsTotals)
-                    if not isinstance(totals, dict):
-                        totals = {}
-
-                    powerflow = {
-                        **powerflow,
-                        **{f"Charts_{key}": val for key, val in charts.items()},
-                        **{f"Totals_{key}": val for key, val in totals.items()},
-                    }
-                if flow:
-                    p_system = flow.get("pSystem")
-                    p_grid = flow.get("pGrid")
-                    p_consum = flow.get("pConsum")
-
-                    if p_system is not None:
-                        powerflow["pv"] = float(p_system) * 1000
-
-                    if p_grid is not None:
-                        powerflow["grid"] = float(p_grid) * 1000
-
-                    if p_consum is not None:
-                        powerflow["load"] = float(p_consum) * 1000
-                # Add the flag so sensors can check if energy statistics are available
-                powerflow[GOODWE_SPELLING.hasEnergyStatisticsCharts] = (
-                    has_energy_statistics_charts
-                )
-
-                homekit_data = result.get(GOODWE_SPELLING.homeKit)
-                if not isinstance(homekit_data, dict):
-                    homekit_data = {}
-                powerflow["sn"] = homekit_data.get("sn")
-
-                # Goodwe 'Power Meter' (not HomeKit) doesn't have a sn
-                # Let's put something in, otherwise we can't see the data.
-                if powerflow["sn"] is None:
-                    powerflow["sn"] = "GW-HOMEKIT-NO-SERIAL"
-
-                # _LOGGER.debug("homeKit sn: %s", result["homKit"]["sn"])
-                # This seems more accurate than the Chart_sum
-                powerflow["all_time_generation"] = kpi.get("total_power")
-
-                homekit = powerflow
-
-            data = SemsData(
-                inverters=inverters_by_sn, homekit=homekit, currency=currency
+            _LOGGER.warning(
+                "SEMS getData returned no data; keeping previous SEMS data and "
+                "updating realtime flow only"
             )
+
+            return SemsData(
+                inverters=previous.inverters,
+                homekit=previous_homekit or previous.homekit,
+                currency=previous.currency,
+            )
+
+        inverters = result.get("inverter")
+        inverters_by_sn: dict[str, dict[str, Any]] = {}
+        if not inverters or not isinstance(inverters, list):
+            raise UpdateFailed(
+                "Error communicating with API: invalid or missing inverter data. "
+                "See debug logs."
+            )
+
+        for inverter in inverters:
+            inverter_full = inverter.get("invert_full")
+            if not isinstance(inverter_full, dict):
+                continue
+
+            name = inverter_full.get("name")
+            sn = inverter_full.get("sn")
+            if not isinstance(sn, str):
+                continue
+
             _LOGGER.debug(
-                "Resulting data: %s",
-                redact_for_log(
-                    {
-                        "inverters": inverters_by_sn,
-                        "homekit": homekit,
-                        "currency": currency,
-                    }
-                ),
+                "Found inverter attribute %s %s",
+                name,
+                redact_for_log(sn),
             )
-            return data
+            inverters_by_sn[sn] = inverter_full
+
+        kpi = result.get("kpi")
+        if not isinstance(kpi, dict):
+            kpi = {}
+        currency = kpi.get("currency")
+
+        has_powerflow = bool(result.get("hasPowerflow")) or bool(flow)
+        has_energy_statistics_charts = bool(
+            result.get(GOODWE_SPELLING.hasEnergyStatisticsCharts)
+        )
+
+        homekit: dict[str, Any] | None = None
+
+        if has_powerflow:
+            _LOGGER.debug("Found powerflow data")
+            powerflow = result.get("powerflow")
+            if not isinstance(powerflow, dict):
+                powerflow = {}
+
+            if has_energy_statistics_charts:
+                charts = result.get(GOODWE_SPELLING.energyStatisticsCharts)
+                if not isinstance(charts, dict):
+                    charts = {}
+                totals = result.get(GOODWE_SPELLING.energyStatisticsTotals)
+                if not isinstance(totals, dict):
+                    totals = {}
+
+                powerflow = {
+                    **powerflow,
+                    **{f"Charts_{key}": val for key, val in charts.items()},
+                    **{f"Totals_{key}": val for key, val in totals.items()},
+                }
+
+            if flow:
+                p_system = flow.get("pSystem")
+                p_grid = flow.get("pGrid")
+                p_consum = flow.get("pConsum")
+
+                if p_system is not None:
+                    powerflow["pv"] = float(p_system) * 1000
+                if p_grid is not None:
+                    powerflow["grid"] = float(p_grid) * 1000
+                if p_consum is not None:
+                    powerflow["load"] = float(p_consum) * 1000
+
+            powerflow[GOODWE_SPELLING.hasEnergyStatisticsCharts] = (
+                has_energy_statistics_charts
+            )
+
+            homekit_data = result.get(GOODWE_SPELLING.homeKit)
+            if not isinstance(homekit_data, dict):
+                homekit_data = {}
+            powerflow["sn"] = homekit_data.get("sn")
+
+            if powerflow["sn"] is None:
+                powerflow["sn"] = "GW-HOMEKIT-NO-SERIAL"
+
+            powerflow["all_time_generation"] = kpi.get("total_power")
+
+            homekit = powerflow
+
+        data = SemsData(
+            inverters=inverters_by_sn, homekit=homekit, currency=currency
+        )
+        _LOGGER.debug(
+            "Resulting data: %s",
+            redact_for_log(
+                {
+                    "inverters": inverters_by_sn,
+                    "homekit": homekit,
+                    "currency": currency,
+                }
+            ),
+        )
+        return data
 
 
-# Type alias to make type inference working for pylance
 type SemsCoordinator = SemsDataUpdateCoordinator
