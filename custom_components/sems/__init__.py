@@ -122,6 +122,11 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
             result = await self.hass.async_add_executor_job(
                 self.sems_api.getData, self.station_id
             )
+            flow = await self.hass.async_add_executor_job(
+                self.sems_api.getFlow, self.station_id
+            )
+
+            _LOGGER.debug("semsApi.getFlow result: %s", redact_for_log(flow))
         except SemsRateLimitedError as err:
             raise UpdateFailed(
                 f"SEMS API rate limited (retry after {err.retry_after}s)"
@@ -188,7 +193,19 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
                         **{f"Charts_{key}": val for key, val in charts.items()},
                         **{f"Totals_{key}": val for key, val in totals.items()},
                     }
+                if flow:
+                    p_system = flow.get("pSystem")
+                    p_grid = flow.get("pGrid")
+                    p_consum = flow.get("pConsum")
 
+                    if p_system is not None:
+                        powerflow["pv"] = float(p_system) * 1000
+
+                    if p_grid is not None:
+                        powerflow["grid"] = float(p_grid) * 1000
+
+                    if p_consum is not None:
+                        powerflow["load"] = float(p_consum) * 1000
                 # Add the flag so sensors can check if energy statistics are available
                 powerflow[GOODWE_SPELLING.hasEnergyStatisticsCharts] = (
                     has_energy_statistics_charts

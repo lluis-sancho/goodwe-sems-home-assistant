@@ -43,6 +43,8 @@ _NewLoginHeaders = {
 _NewLoginFallbackApi = "https://eu-gateway.semsportal.com/web/sems"
 _LegacyApiFallback = "https://eu.semsportal.com/api"
 
+_FlowURLPart = "/sems-plant/api/stations/flow"
+
 type LoginMode = Literal["new", "legacy"]
 type LoginHandler = Callable[[str, str], dict[str, Any] | None]
 
@@ -76,17 +78,25 @@ class SemsApi:
         json_data: dict[str, Any] | None = None,
         operation_name: str = "HTTP request",
         validate_code: bool = True,
+        method: Literal["GET", "POST"] = "POST",
     ) -> dict[str, Any] | None:
         """Make a generic HTTP request with error handling and optional code validation."""
         try:
             _LOGGER.debug("SEMS - Making %s to %s", operation_name, url)
-            response = requests.post(
-                url,
-                headers=headers,
-                data=data,
-                json=json_data,
-                timeout=_RequestTimeout,
-            )
+            if method == "GET":
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=_RequestTimeout,
+                )
+            else:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    data=data,
+                    json=json_data,
+                    timeout=_RequestTimeout,
+                )
 
             _LOGGER.debug("%s Response: %s", operation_name, response)
             # _LOGGER.debug("%s Response text: %s", operation_name, response.text)
@@ -521,6 +531,56 @@ class SemsApi:
         )
         return result if isinstance(result, dict) else {}
 
+    def getFlow(
+        self,
+        powerStationId: str,
+        renewToken: bool = False,
+        maxTokenRetries: int = 2,
+    ) -> dict[str, Any]:
+        """Get current SEMS Plus power flow data."""
+
+        url_part = f"{_FlowURLPart}?stationId={powerStationId}"
+
+        if maxTokenRetries <= 0:
+            _LOGGER.info("SEMS - Maximum token fetch tries reached, aborting flow request")
+            raise OutOfRetries
+
+        context = self._get_authenticated_request_context(
+            url_part,
+            renewToken,
+            "getFlow API call",
+        )
+
+        if context is None:
+            return {}
+
+        api_url, headers = context
+
+        try:
+            json_response = self._make_http_request(
+                api_url,
+                headers,
+                operation_name="getFlow API call",
+                validate_code=True,
+                method="GET",
+            )
+
+            if json_response is None:
+                return self.getFlow(
+                    powerStationId,
+                    renewToken=True,
+                    maxTokenRetries=maxTokenRetries - 1,
+                )
+
+            result = json_response.get("data")
+            return result if isinstance(result, dict) else {}
+
+        except SemsRateLimitedError:
+            raise
+        except (requests.RequestException, ValueError, KeyError) as exception:
+            _LOGGER.error("Unable to complete getFlow API call: %s", exception)
+            return {}
+            
     def _make_control_api_call(
         self,
         data: dict[str, Any],
