@@ -525,6 +525,15 @@ def sensor_options_for_data(
             ),
             SemsHomekitSensorType(
                 device_info,
+                f"{homekit_sn}-total-pv-generation",
+                ["all_time_generation"],
+                "SEMS Total PV Generation",
+                SensorDeviceClass.ENERGY,
+                UnitOfEnergy.KILO_WATT_HOUR,
+                SensorStateClass.TOTAL_INCREASING,
+            ),
+            SemsHomekitSensorType(
+                device_info,
                 f"{homekit_sn}-grid",
                 ["grid"],
                 "HomeKit Grid",
