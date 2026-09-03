@@ -120,8 +120,11 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
                 f"SEMS API rate limited (retry after {err.retry_after}s)"
             ) from err
         except Exception as err:
-            _LOGGER.warning("SEMS getData failed: %s", err)
-            result = {}
+            raise UpdateFailed(f"Error fetching SEMS getData: {err}") from err
+
+        # Si result está vacío, consideramos la actualización fallida para proteger las estadísticas
+        if not result or not isinstance(result, dict):
+            raise UpdateFailed("SEMS getData returned empty or invalid data.")
 
         try:
             flow = await self.hass.async_add_executor_job(
@@ -133,55 +136,16 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
                 f"SEMS API rate limited (retry after {err.retry_after}s)"
             ) from err
         except Exception as err:
-            _LOGGER.warning("SEMS getFlow failed: %s", err)
+            _LOGGER.warning("SEMS getFlow failed, keeping main data: %s", err)
             flow = {}
 
         _LOGGER.debug("semsApi.getData result: %s", redact_for_log(result))
-
-        # If the legacy endpoint is temporarily down, preserve the previous
-        # coordinator data and refresh only the realtime power-flow values.
-        if not result:
-            previous = self.data if isinstance(self.data, SemsData) else None
-
-            if previous is None:
-                raise UpdateFailed(
-                    "Error communicating with API: getData returned no data and "
-                    "there is no previous coordinator data available yet."
-                )
-
-            previous_homekit = (
-                dict(previous.homekit) if isinstance(previous.homekit, dict) else {}
-            )
-
-            if flow:
-                p_system = flow.get("pSystem")
-                p_grid = flow.get("pGrid")
-                p_consum = flow.get("pConsum")
-
-                if p_system is not None:
-                    previous_homekit["pv"] = float(p_system) * 1000
-                if p_grid is not None:
-                    previous_homekit["grid"] = float(p_grid) * 1000
-                if p_consum is not None:
-                    previous_homekit["load"] = float(p_consum) * 1000
-
-            _LOGGER.warning(
-                "SEMS getData returned no data; keeping previous SEMS data and "
-                "updating realtime flow only"
-            )
-
-            return SemsData(
-                inverters=previous.inverters,
-                homekit=previous_homekit or previous.homekit,
-                currency=previous.currency,
-            )
 
         inverters = result.get("inverter")
         inverters_by_sn: dict[str, dict[str, Any]] = {}
         if not inverters or not isinstance(inverters, list):
             raise UpdateFailed(
-                "Error communicating with API: invalid or missing inverter data. "
-                "See debug logs."
+                "Error communicating with API: invalid or missing inverter data."
             )
 
         for inverter in inverters:
