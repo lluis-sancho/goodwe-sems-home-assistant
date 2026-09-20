@@ -236,8 +236,36 @@ class SemsApi:
 
     def _resolve_api_base_for_url_part(self, api_base: str, url_part: str) -> str:
         """Return the effective API base for a given endpoint path."""
-        return self._normalize_powerstation_api_base(api_base, url_part)
 
+        # SEMS+ endpoints use the regional gateway under /web/sems.
+        if url_part.startswith("/sems-plant/"):
+            region = None
+
+            if isinstance(self._token, dict):
+                token_region = self._token.get("region")
+                if isinstance(token_region, str) and token_region:
+                    region = token_region
+
+            if region is None:
+                region = self._extract_gateway_region(api_base)
+
+            if region:
+                rewritten_base = (
+                    f"https://{region}-gateway.semsportal.com/web/sems"
+                )
+            else:
+                rewritten_base = _NewLoginFallbackApi
+
+            _LOGGER.debug(
+                "SEMS - Rewriting API base from %s to %s for SEMS+ endpoint %s",
+                api_base,
+                rewritten_base,
+                url_part,
+            )
+
+            return rewritten_base
+
+        return self._normalize_powerstation_api_base(api_base, url_part)
     def _get_authenticated_request_context(
         self,
         url_part: str,
