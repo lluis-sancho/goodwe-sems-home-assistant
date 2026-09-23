@@ -16,7 +16,7 @@ from .const import redact_for_log
 _LOGGER = logging.getLogger(__name__)
 
 OLD_LOGIN_URL = "https://www.semsportal.com/api/v3/Common/CrossLogin"
-NEW_LOGIN_URL = "https://semsplus.goodwe.com/web/sems/sems-user/api/v1/auth/cross-login"
+NEW_LOGIN_URL = "https://eu-semsplus.goodwe.com/web/sems/sems-user/api/v1/auth/cross-login"
 _GetPowerStationIdByOwnerURLPart = "/PowerStation/GetPowerStationIdByOwner"
 _PowerStationURLPart = "/v3/PowerStation/GetMonitorDetailByPowerstationId"
 # _PowerControlURL = (
@@ -44,6 +44,14 @@ _NewLoginFallbackApi = "https://eu-gateway.semsportal.com/web/sems"
 _LegacyApiFallback = "https://eu.semsportal.com/api"
 
 _FlowURLPart = "/sems-plant/api/stations/flow"
+_GatewayClient = "semsPlusWeb"
+_SemsPlusOrigin = "https://eu-semsplus.goodwe.com"
+_SemsPlusUserAgent = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+_DefaultUserAgent = "PVMaster/2.9.5 (iPhone; iOS 17.5; Scale/3.00)"
 
 type LoginMode = Literal["new", "legacy"]
 type LoginHandler = Callable[[str, str], dict[str, Any] | None]
@@ -311,6 +319,148 @@ class SemsApi:
         )
         return api_url, headers
 
+    def _gateway_signature(self, uid: str, token: str) -> str:
+        """Build the x-signature required by the current SEMS+ gateway."""
+        import time
+
+        timestamp = str(int(time.time() * 1000))
+        digest = hashlib.sha256(
+            f"{timestamp}@{uid}@{token}".encode("utf-8")
+        ).hexdigest()
+        return base64.b64encode(
+            f"{digest}@{timestamp}".encode("utf-8")
+        ).decode("utf-8")
+
+    def _build_gateway_headers(self) -> dict[str, str]:
+        """Build headers matching the SEMS+ web/gateway client."""
+        if self._token is None:
+            raise ValueError("No SEMS token available")
+
+        api_base = self._resolve_api_base_for_url_part(
+            self._token["api"], "/sems-plant/"
+        )
+        uid = str(self._token.get("uid", ""))
+        token = str(self._token.get("token", ""))
+
+        token_payload = {
+            "uid": uid,
+            "timestamp": str(self._token.get("timestamp", "")),
+            "token": token,
+            "client": _GatewayClient,
+            "version": "",
+            "language": "en",
+            "api": api_base,
+            "region": str(self._token.get("region") or "eu"),
+        }
+
+        return {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": _DefaultUserAgent,
+            "token": json.dumps(token_payload),
+            "x-signature": self._gateway_signature(uid, token),
+        }
+
+    def _gateway_request(
+        self,
+        method: Literal["GET", "POST"],
+        url_part: str,
+        query: dict[str, Any] | None = None,
+        renewToken: bool = False,
+        maxTokenRetries: int = 2,
+        operation_name: str = "gateway API call",
+    ) -> Any | None:
+        """Call a SEMS+ gateway endpoint with signature and one token refresh."""
+        from urllib.parse import urlencode
+
+        if maxTokenRetries <= 0:
+            raise OutOfRetries
+
+        if self._token is None or renewToken:
+            self._token = self.getLoginToken(self._username, self._password)
+
+        if self._token is None:
+            _LOGGER.error("SEMS - Unable to obtain token for %s", operation_name)
+            return None
+
+        api_base = self._resolve_api_base_for_url_part(
+            self._token["api"], url_part
+        )
+        api_url = api_base + url_part
+        if query:
+            api_url += "?" + urlencode(query)
+
+        try:
+            json_response = self._make_http_request(
+                api_url,
+                self._build_gateway_headers(),
+                operation_name=operation_name,
+                validate_code=False,
+                method=method,
+            )
+            if json_response is None:
+                return None
+
+            code = json_response.get("code")
+            if str(code) == _RateLimitCode:
+                raise SemsRateLimitedError(
+                    retry_after=_RateLimitRetryAfterSeconds,
+                    message=f"{operation_name} returned rate-limit code {_RateLimitCode}",
+                )
+
+            if code not in _SuccessCodes:
+                _LOGGER.warning(
+                    "SEMS - %s failed: code=%s msg=%s description=%s",
+                    operation_name,
+                    code,
+                    json_response.get("msg"),
+                    json_response.get("description"),
+                )
+                if maxTokenRetries > 1:
+                    return self._gateway_request(
+                        method,
+                        url_part,
+                        query=query,
+                        renewToken=True,
+                        maxTokenRetries=maxTokenRetries - 1,
+                        operation_name=operation_name,
+                    )
+                return None
+
+            return json_response.get("data")
+
+        except SemsRateLimitedError:
+            raise
+        except (requests.RequestException, ValueError, KeyError) as exception:
+            _LOGGER.error("Unable to complete %s: %s", operation_name, exception)
+            return None
+
+    def _flatten_gateway_factors(self, groups: Any) -> dict[str, Any]:
+        """Flatten SEMS+ telemetry factor groups to code -> value."""
+        result: dict[str, Any] = {}
+        if not isinstance(groups, list):
+            return result
+
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            factors = group.get("factors")
+            if not isinstance(factors, list):
+                factors = [group]
+            for factor in factors:
+                if isinstance(factor, dict) and factor.get("code") is not None:
+                    result[str(factor["code"])] = factor.get("data")
+        return result
+
+    def _number(self, value: Any) -> float | None:
+        """Coerce a gateway numeric value without inventing missing values."""
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _build_authenticated_headers(
         self, token_data: dict[str, Any]
     ) -> dict[str, str]:
@@ -457,9 +607,27 @@ class SemsApi:
             "isChinese": False,
             "isLocal": False,
         }
+        login_token_payload = {
+            "uid": "",
+            "timestamp": 0,
+            "token": "",
+            "client": _GatewayClient,
+            "version": "",
+            "language": "en",
+        }
+        login_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": _SemsPlusUserAgent,
+            "Origin": _SemsPlusOrigin,
+            "Referer": f"{_SemsPlusOrigin}/",
+            "token": json.dumps(login_token_payload),
+            "x-signature": self._gateway_signature("", ""),
+        }
+
         json_response = self._make_http_request(
             NEW_LOGIN_URL,
-            _NewLoginHeaders,
+            login_headers,
             json_data=login_data,
             operation_name="SEMS+ login API call",
             validate_code=False,
@@ -571,16 +739,169 @@ class SemsApi:
     def getData(
         self, powerStationId: str, renewToken: bool = False, maxTokenRetries: int = 2
     ) -> dict[str, Any]:
-        """Get the latest data from the SEMS API and updates the state."""
-        data = '{"powerStationId":"' + powerStationId + '"}'
-        result = self._make_api_call(
-            _PowerStationURLPart,
-            data=data,
+        """Get station data from the current SEMS+ gateway.
+
+        GoodWe has retired / stopped populating the classic
+        GetMonitorDetailByPowerstationId response for migrated accounts.
+        Build the legacy-shaped result expected by the HA integration from
+        the SEMS+ station/device/telemetry endpoints instead.
+        """
+        basic_info = self._gateway_request(
+            "POST",
+            "/sems-plant/api/portal/stations/basic/info",
+            query={"stationId": powerStationId},
             renewToken=renewToken,
             maxTokenRetries=maxTokenRetries,
-            operation_name="getData API call",
+            operation_name="getData basic info API call",
         )
-        return result if isinstance(result, dict) else {}
+        if not isinstance(basic_info, dict):
+            basic_info = {}
+
+        all_status = self._gateway_request(
+            "GET",
+            "/sems-plant/api/stations/device/all-status",
+            query={"stationId": powerStationId},
+            renewToken=False,
+            maxTokenRetries=maxTokenRetries,
+            operation_name="getData device status API call",
+        )
+
+        devices: list[dict[str, Any]] = []
+        if isinstance(all_status, dict):
+            detail_lists = all_status.get("deviceDetailList", [])
+            if isinstance(detail_lists, list):
+                for type_group in detail_lists:
+                    if not isinstance(type_group, dict):
+                        continue
+                    device_type = type_group.get("deviceType") or "INVERTER"
+                    status_details = type_group.get("statusDetailList", [])
+                    if not isinstance(status_details, list):
+                        continue
+                    for status_detail in status_details:
+                        if not isinstance(status_detail, dict):
+                            continue
+                        detail_map = status_detail.get("detailMap", {})
+                        if not isinstance(detail_map, dict):
+                            continue
+                        for sn, device_detail in detail_map.items():
+                            detail = (
+                                dict(device_detail)
+                                if isinstance(device_detail, dict)
+                                else {}
+                            )
+                            detail["sn"] = sn
+                            detail["deviceType"] = device_type
+                            devices.append(detail)
+
+        inverters: list[dict[str, Any]] = []
+        for device in devices:
+            sn = str(device.get("sn") or "")
+            if not sn:
+                continue
+
+            device_type = str(device.get("deviceType") or "INVERTER")
+            telemetry = self._gateway_request(
+                "GET",
+                f"/sems-plant/api/equipments/{sn}/telemetry",
+                query={"deviceType": device_type, "pwId": powerStationId},
+                maxTokenRetries=maxTokenRetries,
+                operation_name=f"getData telemetry {sn}",
+            )
+            telecounting = self._gateway_request(
+                "GET",
+                f"/sems-plant/api/equipments/{sn}/telecounting",
+                query={"deviceType": device_type, "pwId": powerStationId},
+                maxTokenRetries=maxTokenRetries,
+                operation_name=f"getData telecounting {sn}",
+            )
+
+            telemetry_flat = self._flatten_gateway_factors(telemetry)
+            telecounting_flat = self._flatten_gateway_factors(telecounting)
+
+            pac_kw = self._number(telemetry_flat.get("pAc"))
+            eday = self._number(telecounting_flat.get("proPvStatsToday"))
+            etotal = self._number(telecounting_flat.get("proPvStatsTotal"))
+
+            inverter = {
+                "sn": sn,
+                "name": device.get("name"),
+                "status": device.get("status"),
+                "pac": pac_kw * 1000 if pac_kw is not None else None,
+                "eday": eday,
+                "etotal": etotal,
+                "temperature": telemetry_flat.get("Temperature"),
+                "invert_full": {
+                    "vpv1": telemetry_flat.get("MPPT-1:Vpv"),
+                    "ipv1": telemetry_flat.get("MPPT-1:Ipv"),
+                    "vpv2": telemetry_flat.get("MPPT-2:Vpv"),
+                    "ipv2": telemetry_flat.get("MPPT-2:Ipv"),
+                    "vac1": telemetry_flat.get("PHASE-A:Vac"),
+                    "iac1": telemetry_flat.get("PHASE-A:Iac"),
+                    "fac1": telemetry_flat.get("Fac"),
+                    "vac2": telemetry_flat.get("PHASE-B:Vac"),
+                    "iac2": telemetry_flat.get("PHASE-B:Iac"),
+                    "fac2": telemetry_flat.get("Fac"),
+                    "vac3": telemetry_flat.get("PHASE-C:Vac"),
+                    "iac3": telemetry_flat.get("PHASE-C:Iac"),
+                    "fac3": telemetry_flat.get("Fac"),
+                },
+            }
+            inverters.append(inverter)
+
+        pac_values = [x.get("pac") for x in inverters if isinstance(x.get("pac"), (int, float))]
+        day_values = [x.get("eday") for x in inverters if isinstance(x.get("eday"), (int, float))]
+        total_values = [x.get("etotal") for x in inverters if isinstance(x.get("etotal"), (int, float))]
+
+        result: dict[str, Any] = {
+            "info": {
+                "stationname": basic_info.get("name"),
+                "capacity": (
+                    basic_info.get("pvCapacity")
+                    if basic_info.get("pvCapacity") is not None
+                    else basic_info.get("installedPower")
+                ),
+                "address": basic_info.get("googleAddress") or basic_info.get("address"),
+                "latitude": basic_info.get("latitude"),
+                "longitude": basic_info.get("longitude"),
+                "status": basic_info.get("status"),
+            },
+            "kpi": {
+                "pac": sum(pac_values) if pac_values else None,
+                "power": sum(day_values) if day_values else None,
+                "total_power": sum(total_values) if total_values else None,
+            },
+            "inverter": inverters,
+        }
+
+        # Keep the already-working flow endpoint. If available, expose it in
+        # the legacy result as well; __init__.py may also fetch getFlow()
+        # separately, so this is intentionally best-effort.
+        try:
+            flow = self.getFlow(
+                powerStationId,
+                renewToken=False,
+                maxTokenRetries=maxTokenRetries,
+            )
+            if isinstance(flow, dict) and flow:
+                result["powerflow"] = flow
+        except (SemsRateLimitedError, OutOfRetries):
+            raise
+        except Exception as exception:  # noqa: BLE001
+            _LOGGER.debug("SEMS - Flow enrichment skipped: %s", exception)
+
+        if not inverters and not basic_info:
+            _LOGGER.error(
+                "SEMS - Gateway getData returned neither station info nor inverter data"
+            )
+            return {}
+
+        _LOGGER.debug(
+            "SEMS - Gateway getData built legacy payload: station=%s inverters=%s pac=%s",
+            result["info"].get("stationname"),
+            len(inverters),
+            result["kpi"].get("pac"),
+        )
+        return result
 
     def getFlow(
         self,
