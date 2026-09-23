@@ -143,8 +143,20 @@ class SemsApi:
 
                 data = json_response.get("data")
                 if data is None or data == "" or data == [] or data == {}:
-                    _LOGGER.error("%s response missing data field", operation_name)
-                    return None
+                    _LOGGER.error(
+                        "SEMS - %s returned success code but no usable data: "
+                        "code=%s msg=%s description=%s api=%s keys=%s payload=%s",
+                        operation_name,
+                        response_code,
+                        json_response.get("msg"),
+                        json_response.get("description"),
+                        json_response.get("api"),
+                        list(json_response.keys()),
+                        redact_for_log(json_response),
+                    )
+                    raise SemsEmptyDataError(
+                        f"{operation_name} returned success code {response_code} without data"
+                    )
 
             return json_response
 
@@ -529,6 +541,17 @@ class SemsApi:
                 exception.retry_after,
             )
             raise
+        except SemsEmptyDataError as exception:
+            # A response with a success code but without data is not normally fixed
+            # by immediately logging in again. Avoid a second request every refresh
+            # cycle, which can make SEMS rate limiting worse.
+            _LOGGER.warning(
+                "SEMS - %s returned no usable data; keeping the current token and "
+                "waiting for the next coordinator refresh: %s",
+                operation_name,
+                exception,
+            )
+            return None
         except (requests.RequestException, ValueError, KeyError) as exception:
             _LOGGER.error("Unable to complete %s: %s", operation_name, exception)
             return None
@@ -605,6 +628,12 @@ class SemsApi:
 
         except SemsRateLimitedError:
             raise
+        except SemsEmptyDataError as exception:
+            _LOGGER.warning(
+                "SEMS - getFlow returned no usable data; waiting for the next refresh: %s",
+                exception,
+            )
+            return {}
         except (requests.RequestException, ValueError, KeyError) as exception:
             _LOGGER.error("Unable to complete getFlow API call: %s", exception)
             return {}
@@ -690,6 +719,10 @@ class SemsApi:
 
 class OutOfRetries(exceptions.HomeAssistantError):
     """Error to indicate too many error attempts."""
+
+
+class SemsEmptyDataError(exceptions.HomeAssistantError):
+    """Error to indicate SEMS returned a successful response without usable data."""
 
 
 class SemsRateLimitedError(exceptions.HomeAssistantError):
