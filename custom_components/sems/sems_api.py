@@ -739,13 +739,7 @@ class SemsApi:
     def getData(
         self, powerStationId: str, renewToken: bool = False, maxTokenRetries: int = 2
     ) -> dict[str, Any]:
-        """Get station data from the current SEMS+ gateway.
-
-        GoodWe has retired / stopped populating the classic
-        GetMonitorDetailByPowerstationId response for migrated accounts.
-        Build the legacy-shaped result expected by the HA integration from
-        the SEMS+ station/device/telemetry endpoints instead.
-        """
+        """Get station data from the current SEMS+ gateway."""
         basic_info = self._gateway_request(
             "POST",
             "/sems-plant/api/portal/stations/basic/info",
@@ -773,7 +767,7 @@ class SemsApi:
                 for type_group in detail_lists:
                     if not isinstance(type_group, dict):
                         continue
-                    device_type = type_group.get("deviceType") or "INVERTER"
+                    device_type = str(type_group.get("deviceType") or "INVERTER")
                     status_details = type_group.get("statusDetailList", [])
                     if not isinstance(status_details, list):
                         continue
@@ -784,33 +778,39 @@ class SemsApi:
                         if not isinstance(detail_map, dict):
                             continue
                         for sn, device_detail in detail_map.items():
-                            detail = (
-                                dict(device_detail)
-                                if isinstance(device_detail, dict)
-                                else {}
-                            )
+                            detail = dict(device_detail) if isinstance(device_detail, dict) else {}
                             detail["sn"] = sn
                             detail["deviceType"] = device_type
                             devices.append(detail)
 
         inverters: list[dict[str, Any]] = []
         for device in devices:
+            device_type = str(device.get("deviceType") or "").upper()
+
+            # SMART_METER and other devices must not be exposed as inverters.
+            if device_type != "INVERTER":
+                _LOGGER.debug(
+                    "SEMS - Skipping non-inverter device %s type=%s",
+                    redact_for_log(device.get("sn")),
+                    device_type,
+                )
+                continue
+
             sn = str(device.get("sn") or "")
             if not sn:
                 continue
 
-            device_type = str(device.get("deviceType") or "INVERTER")
             telemetry = self._gateway_request(
                 "GET",
                 f"/sems-plant/api/equipments/{sn}/telemetry",
-                query={"deviceType": device_type, "pwId": powerStationId},
+                query={"deviceType": "INVERTER", "pwId": powerStationId},
                 maxTokenRetries=maxTokenRetries,
                 operation_name=f"getData telemetry {sn}",
             )
             telecounting = self._gateway_request(
                 "GET",
                 f"/sems-plant/api/equipments/{sn}/telecounting",
-                query={"deviceType": device_type, "pwId": powerStationId},
+                query={"deviceType": "INVERTER", "pwId": powerStationId},
                 maxTokenRetries=maxTokenRetries,
                 operation_name=f"getData telecounting {sn}",
             )
@@ -821,36 +821,74 @@ class SemsApi:
             pac_kw = self._number(telemetry_flat.get("pAc"))
             eday = self._number(telecounting_flat.get("proPvStatsToday"))
             etotal = self._number(telecounting_flat.get("proPvStatsTotal"))
+            temperature = telemetry_flat.get("Temperature")
+
+            capacity = device.get("capacity")
+            if capacity is None:
+                capacity = basic_info.get("pvCapacity")
+            if capacity is None:
+                capacity = basic_info.get("installedPower")
+
+            legacy_full: dict[str, Any] = {
+                "sn": sn,
+                "name": device.get("name"),
+                "status": device.get("status"),
+                "capacity": capacity,
+                "pac": pac_kw * 1000 if pac_kw is not None else None,
+                "eday": eday,
+                "etotal": etotal,
+
+                # GOODWE_SPELLING.temperature uses the historic typo
+                # "tempperature", so keep both forms.
+                "temperature": temperature,
+                "tempperature": temperature,
+
+                "vpv1": telemetry_flat.get("MPPT-1:Vpv"),
+                "ipv1": telemetry_flat.get("MPPT-1:Ipv"),
+                "vpv2": telemetry_flat.get("MPPT-2:Vpv"),
+                "ipv2": telemetry_flat.get("MPPT-2:Ipv"),
+                "vpv3": telemetry_flat.get("MPPT-3:Vpv"),
+                "ipv3": telemetry_flat.get("MPPT-3:Ipv"),
+                "vpv4": telemetry_flat.get("MPPT-4:Vpv"),
+                "ipv4": telemetry_flat.get("MPPT-4:Ipv"),
+
+                "vac1": telemetry_flat.get("PHASE-A:Vac"),
+                "iac1": telemetry_flat.get("PHASE-A:Iac"),
+                "fac1": telemetry_flat.get("Fac"),
+                "vac2": telemetry_flat.get("PHASE-B:Vac"),
+                "iac2": telemetry_flat.get("PHASE-B:Iac"),
+                "fac2": telemetry_flat.get("Fac"),
+                "vac3": telemetry_flat.get("PHASE-C:Vac"),
+                "iac3": telemetry_flat.get("PHASE-C:Iac"),
+                "fac3": telemetry_flat.get("Fac"),
+            }
 
             inverter = {
                 "sn": sn,
                 "name": device.get("name"),
                 "status": device.get("status"),
-                "pac": pac_kw * 1000 if pac_kw is not None else None,
+                "capacity": capacity,
+                "pac": legacy_full["pac"],
                 "eday": eday,
                 "etotal": etotal,
-                "temperature": telemetry_flat.get("Temperature"),
-                "invert_full": {
-                    "vpv1": telemetry_flat.get("MPPT-1:Vpv"),
-                    "ipv1": telemetry_flat.get("MPPT-1:Ipv"),
-                    "vpv2": telemetry_flat.get("MPPT-2:Vpv"),
-                    "ipv2": telemetry_flat.get("MPPT-2:Ipv"),
-                    "vac1": telemetry_flat.get("PHASE-A:Vac"),
-                    "iac1": telemetry_flat.get("PHASE-A:Iac"),
-                    "fac1": telemetry_flat.get("Fac"),
-                    "vac2": telemetry_flat.get("PHASE-B:Vac"),
-                    "iac2": telemetry_flat.get("PHASE-B:Iac"),
-                    "fac2": telemetry_flat.get("Fac"),
-                    "vac3": telemetry_flat.get("PHASE-C:Vac"),
-                    "iac3": telemetry_flat.get("PHASE-C:Iac"),
-                    "fac3": telemetry_flat.get("Fac"),
-                },
+                "temperature": temperature,
+                "tempperature": temperature,
+                "invert_full": legacy_full,
             }
             inverters.append(inverter)
 
-        pac_values = [x.get("pac") for x in inverters if isinstance(x.get("pac"), (int, float))]
-        day_values = [x.get("eday") for x in inverters if isinstance(x.get("eday"), (int, float))]
-        total_values = [x.get("etotal") for x in inverters if isinstance(x.get("etotal"), (int, float))]
+        pac_values = [
+            x.get("pac") for x in inverters
+            if isinstance(x.get("pac"), (int, float))
+        ]
+        day_values = [
+            x.get("eday") for x in inverters
+            if isinstance(x.get("eday"), (int, float))
+        ]
+        total_values = [
+            x.get("etotal") for x in inverters
+            if isinstance(x.get("etotal"), (int, float))
+        ]
 
         result: dict[str, Any] = {
             "info": {
@@ -873,9 +911,6 @@ class SemsApi:
             "inverter": inverters,
         }
 
-        # Keep the already-working flow endpoint. If available, expose it in
-        # the legacy result as well; __init__.py may also fetch getFlow()
-        # separately, so this is intentionally best-effort.
         try:
             flow = self.getFlow(
                 powerStationId,
