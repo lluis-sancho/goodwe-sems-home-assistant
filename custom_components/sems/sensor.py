@@ -505,20 +505,22 @@ def sensor_options_for_data(
                 UnitOfPower.WATT,
                 SensorStateClass.MEASUREMENT,
             ),
+            # Reuse the historical unique IDs so the existing entities
+            # "Consum - Panels" and "Generació - Panels" receive SEMS+ data.
             SemsHomekitSensorType(
                 device_info,
-                f"{homekit_sn}-load",
+                "homeKit-load",
                 ["load"],
-                "HomeKit Load",
+                "Consum - Panels",
                 SensorDeviceClass.POWER,
                 UnitOfPower.WATT,
                 SensorStateClass.MEASUREMENT,
             ),
             SemsHomekitSensorType(
                 device_info,
-                f"{homekit_sn}-pv",
+                "homeKit-pv",
                 ["pv"],
-                "HomeKit PV",
+                "Generació - Panels",
                 SensorDeviceClass.POWER,
                 UnitOfPower.WATT,
                 SensorStateClass.MEASUREMENT,
