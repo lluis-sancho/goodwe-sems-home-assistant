@@ -149,21 +149,40 @@ class SemsDataUpdateCoordinator(DataUpdateCoordinator[SemsData]):
             )
 
         for inverter in inverters:
-            inverter_full = inverter.get("invert_full")
-            if not isinstance(inverter_full, dict):
+            if not isinstance(inverter, dict):
                 continue
 
-            name = inverter_full.get("name")
-            sn = inverter_full.get("sn")
-            if not isinstance(sn, str):
+            # En la API SEMS+ actual, sn/name/status/pac/etc. están en el
+            # nivel superior y los valores eléctricos detallados en invert_full.
+            sn = inverter.get("sn")
+            name = inverter.get("name")
+
+            if not isinstance(sn, str) or not sn:
                 continue
+
+            inverter_full = inverter.get("invert_full")
+            if not isinstance(inverter_full, dict):
+                inverter_full = {}
+
+            # Reconstruimos el formato que espera el resto de la integración.
+            inverter_data = {
+                **inverter_full,
+                "sn": sn,
+                "name": name,
+                "status": inverter.get("status"),
+                "pac": inverter.get("pac"),
+                "eday": inverter.get("eday"),
+                "etotal": inverter.get("etotal"),
+                "temperature": inverter.get("temperature"),
+            }
 
             _LOGGER.debug(
                 "Found inverter attribute %s %s",
                 name,
                 redact_for_log(sn),
             )
-            inverters_by_sn[sn] = inverter_full
+
+            inverters_by_sn[sn] = inverter_data
 
         kpi = result.get("kpi")
         if not isinstance(kpi, dict):
