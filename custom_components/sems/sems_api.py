@@ -800,11 +800,11 @@ class SemsApi:
                         maxTokenRetries=maxTokenRetries,
                         operation_name=f"debug SMART_METER telemetry {meter_sn}",
                     )
-                    meter_flat = self._flatten_gateway_factors(meter_telemetry)
+                    
                     _LOGGER.warning(
-                        "SEMS - SMART_METER FACTORS %s: %s",
+                        "SEMS - SMART_METER RAW DATA %s: %s",
                         redact_for_log(meter_sn),
-                        meter_flat,
+                        meter_telemetry,
                     )
                 continue
 
