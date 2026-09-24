@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+from datetime import datetime
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -44,6 +45,7 @@ _NewLoginFallbackApi = "https://eu-gateway.semsportal.com/web/sems"
 _LegacyApiFallback = "https://eu.semsportal.com/api"
 
 _FlowURLPart = "/sems-plant/api/stations/flow"
+_ProductionURLPart = "/sems-plant/api/stations/production"
 _GatewayClient = "semsPlusWeb"
 _SemsPlusOrigin = "https://eu-semsplus.goodwe.com"
 _SemsPlusUserAgent = (
@@ -366,6 +368,7 @@ class SemsApi:
         method: Literal["GET", "POST"],
         url_part: str,
         query: dict[str, Any] | None = None,
+        json_data: dict[str, Any] | None = None,
         renewToken: bool = False,
         maxTokenRetries: int = 2,
         operation_name: str = "gateway API call",
@@ -394,6 +397,7 @@ class SemsApi:
             json_response = self._make_http_request(
                 api_url,
                 self._build_gateway_headers(),
+                json_data=json_data,
                 operation_name=operation_name,
                 validate_code=False,
                 method=method,
@@ -421,6 +425,7 @@ class SemsApi:
                         method,
                         url_part,
                         query=query,
+                        json_data=json_data,
                         renewToken=True,
                         maxTokenRetries=maxTokenRetries - 1,
                         operation_name=operation_name,
@@ -787,27 +792,8 @@ class SemsApi:
         for device in devices:
             device_type = str(device.get("deviceType") or "").upper()
 
-            # SMART_METER must not be exposed as an inverter, but log its
-            # telemetry temporarily so we can identify the accumulated
-            # grid import/export counters used by SEMS Total Import/Export.
-            if device_type == "SMART_METER":
-                meter_sn = str(device.get("sn") or "")
-                if meter_sn:
-                    meter_telemetry = self._gateway_request(
-                        "GET",
-                        f"/sems-plant/api/equipments/{meter_sn}/telemetry",
-                        query={"deviceType": "SMART_METER", "pwId": powerStationId},
-                        maxTokenRetries=maxTokenRetries,
-                        operation_name=f"debug SMART_METER telemetry {meter_sn}",
-                    )
-                    
-                    _LOGGER.warning(
-                        "SEMS - SMART_METER RAW DATA %s: %s",
-                        redact_for_log(meter_sn),
-                        meter_telemetry,
-                    )
-                continue
-
+            # Only inverter devices are exposed here. SMART_METER and other
+            # device types are intentionally skipped.
             if device_type != "INVERTER":
                 _LOGGER.debug(
                     "SEMS - Skipping non-inverter device %s type=%s",
@@ -931,6 +917,38 @@ class SemsApi:
             "inverter": inverters,
         }
 
+        # SEMS+ exposes accumulated grid import/export through the station
+        # production endpoint. Request a deliberately old start date so the
+        # returned values represent the station lifetime totals without
+        # hard-coding this installation's commissioning date.
+        now = datetime.now()
+        production_payload = {
+            "stationId": powerStationId,
+            "items": ["proGridStats", "proPurchaseStats"],
+            "dimension": "year",
+            "isReport": False,
+            "startTime": "2000-01-01 00:00:00",
+            "endTime": now.strftime("%Y-%m-%d 23:59:59"),
+        }
+        production = self._gateway_request(
+            "POST",
+            _ProductionURLPart,
+            json_data=production_payload,
+            renewToken=False,
+            maxTokenRetries=maxTokenRetries,
+            operation_name="getData production totals API call",
+        )
+        total_sell = None
+        total_buy = None
+        if isinstance(production, dict):
+            total_sell = self._number(production.get("proGridStats"))
+            total_buy = self._number(production.get("proPurchaseStats"))
+            _LOGGER.debug(
+                "SEMS - Production totals: import=%s kWh export=%s kWh",
+                total_buy,
+                total_sell,
+            )
+
         try:
             flow = self.getFlow(
                 powerStationId,
@@ -938,6 +956,12 @@ class SemsApi:
                 maxTokenRetries=maxTokenRetries,
             )
             if isinstance(flow, dict) and flow:
+                # Keep the legacy HomeKit parser contract: it builds
+                # SemsData.homekit directly from result["powerflow"].
+                if total_buy is not None:
+                    flow["Totals_buy"] = total_buy
+                if total_sell is not None:
+                    flow["Totals_sell"] = total_sell
                 result["powerflow"] = flow
         except (SemsRateLimitedError, OutOfRetries):
             raise
