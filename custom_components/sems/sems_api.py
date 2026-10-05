@@ -1170,17 +1170,27 @@ class SemsApi:
                     )
                     for dimension, start, end in statistic_ranges
                 ]
-                historic_statistics_future = executor.submit(
-                    self._get_web_statistics,
-                    power_station_id,
-                    "year",
-                    datetime(install_year, 1, 1),
-                    datetime(current_year + 1, 1, 1) - timedelta(seconds=1),
-                )
+                historic_statistics_futures = [
+                    executor.submit(
+                        self._get_web_statistics,
+                        power_station_id,
+                        "year",
+                        datetime(year, 1, 1),
+                        datetime(year + 1, 1, 1) - timedelta(seconds=1),
+                    )
+                    for year in range(install_year, current_year + 1)
+                ]
 
                 production_data = production_future.result()
                 statistic_data = [future.result() for future in statistics_futures]
-                historic_statistics = historic_statistics_future.result()
+
+                historic_statistics: dict[str, list[float]] = {}
+                for future in historic_statistics_futures:
+                    yearly_statistics = future.result()
+                    if not yearly_statistics:
+                        continue
+                    for item, values in yearly_statistics.items():
+                        historic_statistics.setdefault(item, []).extend(values)            
 
             if production_data and isinstance(production_data.get("currency"), str):
                 currency = production_data.get("currency")
