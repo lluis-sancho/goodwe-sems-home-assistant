@@ -967,11 +967,15 @@ class SemsApi:
         dimension: str,
         start: datetime,
         end: datetime,
-    ) -> dict[str, list[float]] | None:
+    ) -> dict[str, list[float]] | None:    
         cache_key = f"{power_station_id}:{dimension}:{start.date()}:{end.date()}"
+
+        current_year = dt_util.now().year
+        is_current_year = dimension == "year" and start.year == current_year
+
         refresh = (
             _WEB_STATISTICS_REFRESH_SECONDS
-            if dimension == "day"
+            if dimension == "day" or is_current_year
             else _WEB_HISTORIC_STATISTICS_REFRESH_SECONDS
         )
         cached = self._get_web_cache_entry(cache_key)
